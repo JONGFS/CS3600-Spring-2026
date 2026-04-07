@@ -28,12 +28,15 @@ DIRS = (
 
 class PlayerAgent:
     """
-    Biden v3 - Carpet Blitz:
-    - EXTREMELY conservative search (only when near-certain)
-    - Aggressive carpet expansion: primes everywhere, carpets whenever possible
+    Biden v4 - The Unifier:
+    - HMM belief tracking + search evidence
+    - Balanced search: not too aggressive, not too conservative
     - High-value carpet snap (>= 10 pts instant take)
-    - Hard search ban after any miss (5-turn cooldown)
-    - Game-phase policy
+    - 2-ply chain value for prime planning
+    - Opponent blocking primes
+    - Game-phase policy with score-awareness
+    - Mobility / dead-end safety
+    - Small carpet hold rule
     """
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -65,7 +68,7 @@ class PlayerAgent:
         self._search_cooldown = 0
 
     def commentate(self):
-        return "Carpet Blitz"
+        return "The Unifier"
 
     def play(self, board: board.Board, sensor_data, time_left: Callable = None):
         noise, dist = sensor_data
@@ -147,6 +150,7 @@ class PlayerAgent:
 
         fc = self._future_carpet(board, end)
         adj = self._adj_space(board, end)
+        mobility = self._mobility_score(board, end)
 
         top1 = max(self.belief) if self.belief else 0.0
         top3 = sum(sorted(self.belief, reverse=True)[:3])
@@ -157,43 +161,43 @@ class PlayerAgent:
         ed = self._expected_dist(end)
 
         if hot:
-            rb = 0.50 * l1 + 0.22 * l2 - 0.10 * ed
+            rb = 0.55 * l1 + 0.25 * l2 - 0.10 * ed
         else:
-            rb = 0.08 * l1 - 0.01 * ed
+            rb = 0.10 * l1 - 0.01 * ed
 
-        cp = 0.035 * self._manhattan(end, (BS // 2, BS // 2))
+        cp = 0.030 * self._manhattan(end, (BS // 2, BS // 2))
         tl = self._turns_remaining(board)
 
         block_bonus = self._block_bonus(board, end, mt)
 
         if mt == enums.MoveType.CARPET:
             pts = enums.CARPET_POINTS_TABLE.get(getattr(m, "roll_length", 0), 0)
-            s = 3.00 * pts + 0.15 * fc + 0.06 * adj + 0.30 * rb - cp
+            s = 3.10 * pts + 0.15 * fc + 0.06 * adj + 0.35 * rb - cp
 
             if pts <= 1 and fc >= pts + 3:
                 s -= 5.0
             elif pts <= 0:
                 s -= 2.5
             elif pts == 2:
-                s -= 0.15
+                s -= 0.10
 
-            return s + block_bonus
+            return s + block_bonus + 0.15 * mobility
 
         if mt == enums.MoveType.PRIME:
-            s = 1.80 + 0.80 * fc + 0.26 * adj + 0.24 * rb - cp
+            s = 1.85 + 0.85 * fc + 0.28 * adj + 0.28 * rb - cp
 
             two_ply = self._two_ply_carpet_value(board, me, m)
-            s += 0.60 * two_ply
+            s += 0.65 * two_ply
 
             if tl <= 10:
                 s += 0.35
-            return s + block_bonus
+            return s + block_bonus + 0.15 * mobility
 
         if mt == enums.MoveType.PLAIN:
-            s = -0.90 + 0.80 * fc + 0.20 * adj + 0.55 * rb - cp
+            s = -0.85 + 0.80 * fc + 0.22 * adj + 0.60 * rb - cp
             if tl <= 8:
                 s += 0.30
-            return s + block_bonus
+            return s + block_bonus + 0.20 * mobility
 
         return -9999.0
 
@@ -216,6 +220,16 @@ class PlayerAgent:
             best_after = max(best_after, enums.CARPET_POINTS_TABLE.get(run, 0))
 
         return best_after
+
+    def _mobility_score(self, board, loc):
+        count = 0
+        for d in DIRS:
+            nxt = enums.loc_after_direction(loc, d)
+            if self._in(nxt):
+                cell = board.get_cell(nxt)
+                if cell in (enums.Cell.SPACE, enums.Cell.PRIMED):
+                    count += 1
+        return count
 
     def _block_bonus(self, board, end, mt):
         if self._block_target is None or self._opp_carpet_dir is None:
@@ -258,40 +272,43 @@ class PlayerAgent:
 
         tl = self._turns_remaining(board)
         top3 = sum(sorted(self.belief, reverse=True)[:3])
+        top5 = sum(sorted(self.belief, reverse=True)[:5])
 
         ev = 4.0 * p - 2.0 * (1.0 - p)
-        if ev <= 1.0:
+        if ev <= 0.8:
             return False
 
-        penalty = min(self._failed_searches * 0.08, 0.32)
+        penalty = min(self._failed_searches * 0.05, 0.20)
 
         if tl >= 26:
-            base_thresh = 0.68
+            base_thresh = 0.58
         elif tl >= 11:
-            base_thresh = 0.60
+            base_thresh = 0.50
         else:
-            base_thresh = 0.52
+            base_thresh = 0.42
 
         my_pts = board.player_worker.get_points()
         opp_pts = board.opponent_worker.get_points()
         diff = my_pts - opp_pts
-        if diff > 3:
-            base_thresh += 0.10
-        elif diff < -8:
-            base_thresh -= 0.08
+        if diff > 5:
+            base_thresh += 0.06
+        elif diff < -5:
+            base_thresh -= 0.06
 
         threshold = base_thresh - penalty
 
-        if ev < best_non_search_score * 0.4:
+        if ev < best_non_search_score * 0.45:
             return False
 
         if p >= threshold:
             return True
-        if tl <= 6 and p >= threshold - 0.08:
+        if tl <= 10 and p >= threshold - 0.06:
             return True
-        if tl <= 3 and p >= threshold - 0.12:
+        if tl <= 5 and p >= threshold - 0.10:
             return True
-        if top3 >= 0.85 and p >= threshold - 0.05:
+        if top3 >= 0.75 and p >= threshold - 0.04:
+            return True
+        if top5 >= 0.88 and p >= threshold - 0.03:
             return True
 
         return False
@@ -421,7 +438,7 @@ class PlayerAgent:
                     self.belief[idx] = 0.0
                     changed = True
                     self._failed_searches += 1
-                    self._search_cooldown = 5
+                    self._search_cooldown = 3
 
         if changed:
             if sum(self.belief) <= EPS:
