@@ -1,3 +1,7 @@
 .venv
 .vscode
 .DS_Store
+__pycache__
+
+3600-agents/matches
+*.json
