@@ -5,3 +5,4 @@ __pycache__
 
 3600-agents/matches
 *.json
+*.zip

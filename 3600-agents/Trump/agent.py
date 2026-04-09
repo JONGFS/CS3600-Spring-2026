@@ -1,646 +1,590 @@
+from __future__ import annotations
+
 from collections.abc import Callable
-import random
+from math import inf
+from typing import Dict, List, Sequence, Tuple
 
-from game import board, enums
+from game import board as game_board
+from game import enums, move
 
+
+BOARD_SIZE = enums.BOARD_SIZE
+CELL_COUNT = BOARD_SIZE * BOARD_SIZE
+MAX_DISTANCE_OBS = (BOARD_SIZE - 1) * 2 + 2
+DIRS = (
+    enums.Direction.UP,
+    enums.Direction.RIGHT,
+    enums.Direction.DOWN,
+    enums.Direction.LEFT,
+)
 NOISE_PROBS = {
     enums.Cell.BLOCKED: (0.5, 0.3, 0.2),
     enums.Cell.SPACE: (0.7, 0.15, 0.15),
     enums.Cell.PRIMED: (0.1, 0.8, 0.1),
     enums.Cell.CARPET: (0.1, 0.1, 0.8),
 }
-
-DIST_ERROR_PROBS = (0.12, 0.7, 0.12, 0.06)
-DIST_OFFSETS = (-1, 0, 1, 2)
-
-BS = enums.BOARD_SIZE
-NC = BS * BS
-EPS = 1e-12
+DISTANCE_ERROR_OFFSETS = (-1, 0, 1, 2)
+DISTANCE_ERROR_PROBS = (0.12, 0.7, 0.12, 0.06)
+CARPET_VALUES = enums.CARPET_POINTS_TABLE
 
 
 class PlayerAgent:
-    """
-    Kennedy:
-    - board-first hybrid
-    - HMM rat tracking with corrected spawn/reset handling
-    - search only when belief is concentrated
-    - lightweight opponent carpet-pattern detection
-    - defensive blocking-prime bonus against continued carpet lanes
-    """
-
-    def __init__(self, board, transition_matrix=None, time_left: Callable = None):
-        try:
-            self.T = transition_matrix.tolist()
-        except Exception:
-            self.T = None
-
-        self.base_prior = self._compute_spawn_prior()
-        self.belief = self.base_prior[:]
-        self.turn = 0
-        self._last_search_signature = None
-
-        # Opponent-pattern tracking
-        self._prev_opponent_pos = None
-        self._prev_carpet_mask = None
-        self._opponent_carpet_direction = None
-        self._opponent_carpet_run_length = 0
-        self._opponent_pattern_age = 999
-        self._blocking_prime_target = None
+    def __init__(
+        self,
+        board: game_board.Board,
+        transition_matrix=None,
+        time_left: Callable | None = None,
+    ):
+        self.transitions = self._build_sparse_transitions(transition_matrix)
+        self.search_prior = self._compute_headstart_prior()
+        self.belief = list(self.search_prior)
+        self.distance_likelihood = self._precompute_distance_likelihoods()
+        self.ttable: Dict[Tuple, Tuple[int, float]] = {}
+        self.nodes = 0
+        self.cutoffs = 0
+        self.max_depth_reached = 0
+        self.turn_depths: List[int] = []
+        self.turn_times: List[float] = []
+        self.last_player_search = (None, False)
+        self.last_opponent_search = (None, False)
+        self.last_turn_seen = -1
 
     def commentate(self):
+        # if not self.turn_depths:
+        #     return "Trump: no turns played"
+        # avg_depth = sum(self.turn_depths) / len(self.turn_depths)
+        # avg_time = sum(self.turn_times) / len(self.turn_times)
+        # return (
+        #     f"Trump: avg_depth={avg_depth:.2f}, max_depth={self.max_depth_reached}, "
+        #     f"avg_time={avg_time:.2f}s, nodes={self.nodes}, cutoffs={self.cutoffs}"
+        # )
         return ""
 
     def play(
         self,
-        board: board.Board,
-        sensor_data,
+        board: game_board.Board,
+        sensor_data: Tuple,
         time_left: Callable,
     ):
-        noise_obs, dist_obs = sensor_data
+        self._synchronize_belief(board, sensor_data)
 
-        # Belief update
-        self._apply_search_evidence(board)
-        self._predict_one_step()
-        self._observe(board, noise_obs, dist_obs)
-        self.turn += 1
+        legal_moves = board.get_valid_moves()
+        candidate_searches = self._candidate_search_moves(board)
+        if not legal_moves and candidate_searches:
+            return candidate_searches[0]
+        if not legal_moves:
+            return move.Move.search(self._best_belief_cell())
 
-        # Opponent-pattern update
-        self._detect_opponent_pattern(board)
-        self._blocking_prime_target = self._find_blocking_prime_target(board)
+        start_remaining = time_left()
+        budget = self._turn_budget(board, start_remaining)
+        deadline = max(0.02, start_remaining - budget)
 
-        all_moves = board.get_valid_moves(exclude_search=False)
-        if not all_moves:
-            return None
+        ordered_moves = self._ordered_root_moves(board, legal_moves, candidate_searches)
+        best_move = ordered_moves[0]
+        best_value = -inf
+        completed_depth = 0
+        self.ttable.clear()
 
-        search_moves = [
-            m
-            for m in all_moves
-            if getattr(m, "move_type", None) == enums.MoveType.SEARCH
-        ]
-        non_search_moves = [
-            m
-            for m in all_moves
-            if getattr(m, "move_type", None) != enums.MoveType.SEARCH
-        ]
-
-        high_value_carpets = [
-            m
-            for m in non_search_moves
-            if getattr(m, "move_type", None) == enums.MoveType.CARPET
-            and enums.CARPET_POINTS_TABLE.get(getattr(m, "roll_length", 0), 0) >= 10
-        ]
-        if high_value_carpets:
-            return max(
-                high_value_carpets,
-                key=lambda m: enums.CARPET_POINTS_TABLE.get(
-                    getattr(m, "roll_length", 0), 0
-                ),
-            )
-
-        best_non_search = None
-        best_non_search_score = float("-inf")
-        for m in non_search_moves:
-            s = self._score_non_search(board, m)
-            if s > best_non_search_score:
-                best_non_search_score = s
-                best_non_search = m
-
-        best_search = None
-        best_search_prob = -1.0
-        for m in search_moves:
-            loc = self._search_target(m)
-            if loc is None:
-                continue
-            p = self._belief_at(loc)
-            if p > best_search_prob:
-                best_search_prob = p
-                best_search = m
-
-        if best_search is not None and self._should_search(board, best_search_prob):
-            return best_search
-
-        if best_non_search is not None:
-            return best_non_search
-
-        return random.choice(all_moves)
-
-    # ----------------------------
-    # Search decision
-    # ----------------------------
-
-    def _should_search(self, board, best_search_prob):
-        turns_left = self._turns_remaining(board)
-        top3 = self._top_mass(3)
-        top5 = self._top_mass(5)
-
-        if best_search_prob >= 0.58:
-            return True
-        if turns_left <= 8 and best_search_prob >= 0.48:
-            return True
-        if top3 >= 0.72 and best_search_prob >= 0.50:
-            return True
-        if top5 >= 0.85 and best_search_prob >= 0.46:
-            return True
-        return False
-
-    # ----------------------------
-    # Non-search move scoring
-    # ----------------------------
-
-    def _score_non_search(self, board, m):
-        move_type = getattr(m, "move_type", None)
-        cur_loc = self._my_loc(board)
-        end_loc = self._end_loc(cur_loc, m)
-
-        next_board = None
-        if hasattr(board, "forecast_move"):
+        for depth in range(1, 16):
+            if time_left() <= max(0.02, deadline):
+                break
             try:
-                next_board = board.forecast_move(m)
-            except Exception:
-                next_board = None
-        if next_board is None:
-            next_board = board
-
-        future_carpet = self._best_future_carpet_points(next_board, end_loc)
-        adj_space = self._adjacent_space_count(next_board, end_loc)
-
-        top1 = max(self.belief) if self.belief else 0.0
-        top3 = self._top_mass(3)
-        rat_mode = (top1 >= 0.28) or (top3 >= 0.60)
-
-        local1 = self._local_mass(end_loc, 1)
-        local2 = self._local_mass(end_loc, 2)
-        exp_dist = self._expected_distance(end_loc)
-
-        if rat_mode:
-            rat_bonus = 0.45 * local1 + 0.20 * local2 - 0.08 * exp_dist
-        else:
-            rat_bonus = 0.10 * local1 - 0.02 * exp_dist
-
-        center_penalty = 0.04 * self._manhattan(end_loc, (BS // 2, BS // 2))
-        turns_left = self._turns_remaining(board)
-
-        if move_type == enums.MoveType.CARPET:
-            pts = enums.CARPET_POINTS_TABLE.get(getattr(m, "roll_length", 0), 0)
-            score = (
-                2.65 * pts
-                + 0.10 * future_carpet
-                + 0.05 * adj_space
-                + 0.35 * rat_bonus
-                - center_penalty
-            )
-
-            if pts <= 0:
-                score -= 1.5
-            elif pts == 2:
-                score -= 0.2
-
-            return score
-
-        if move_type == enums.MoveType.PRIME:
-            score = (
-                1.55
-                + 0.70 * future_carpet
-                + 0.22 * adj_space
-                + 0.25 * rat_bonus
-                - center_penalty
-            )
-
-            # Defensive bonus: if we can prime the next likely square in the
-            # opponent's carpet lane, reward that move.
-            score += self._blocking_prime_bonus(board, end_loc)
-
-            if turns_left <= 8:
-                score += 0.20
-
-            return score
-
-        if move_type == enums.MoveType.PLAIN:
-            score = (
-                -0.75
-                + 0.72 * future_carpet
-                + 0.18 * adj_space
-                + 0.60 * rat_bonus
-                - center_penalty
-            )
-
-            # If pattern is active, slightly prefer repositioning toward the blocking square.
-            score += self._blocking_plain_bonus(end_loc)
-
-            if turns_left <= 6:
-                score += 0.15
-
-            return score
-
-        return -9999.0
-
-    def _blocking_prime_bonus(self, board, end_loc):
-        if self._blocking_prime_target is None:
-            return 0.0
-        if self._opponent_carpet_direction is None:
-            return 0.0
-        if self._opponent_pattern_age > 2:
-            return 0.0
-        if end_loc != self._blocking_prime_target:
-            return 0.0
-
-        opp_pos = board.opponent_worker.get_location()
-        d = self._manhattan(opp_pos, end_loc)
-
-        bonus = 1.35
-        if d <= 2:
-            bonus += 0.55
-        elif d <= 4:
-            bonus += 0.25
-
-        bonus += 0.10 * min(self._opponent_carpet_run_length, 4)
-        return bonus
-
-    def _blocking_plain_bonus(self, end_loc):
-        if self._blocking_prime_target is None:
-            return 0.0
-        if self._opponent_pattern_age > 1:
-            return 0.0
-
-        # Mild positioning bias only; do not let this dominate board economy.
-        d = self._manhattan(end_loc, self._blocking_prime_target)
-        if d == 0:
-            return 0.20
-        if d == 1:
-            return 0.10
-        return 0.0
-
-    # ----------------------------
-    # Opponent pattern detection
-    # ----------------------------
-
-    def _detect_opponent_pattern(self, board):
-        opp_pos = board.opponent_worker.get_location()
-        cur_carpet = getattr(board, "_carpet_mask", None)
-
-        if self._prev_opponent_pos is None or cur_carpet is None:
-            self._prev_opponent_pos = opp_pos
-            self._prev_carpet_mask = cur_carpet
-            return
-
-        new_carpet = 0
-        if self._prev_carpet_mask is not None:
-            new_carpet = cur_carpet & ~self._prev_carpet_mask
-
-        if new_carpet:
-            direction, length = self._extract_carpet_info(
-                self._prev_opponent_pos, new_carpet
-            )
-            if direction is not None:
-                self._opponent_carpet_direction = direction
-                self._opponent_carpet_run_length = length
-                self._opponent_pattern_age = 0
-            else:
-                self._opponent_pattern_age += 1
-        else:
-            self._opponent_pattern_age += 1
-
-        if self._opponent_pattern_age > 4:
-            self._opponent_carpet_direction = None
-            self._opponent_carpet_run_length = 0
-
-        self._prev_opponent_pos = opp_pos
-        self._prev_carpet_mask = cur_carpet
-
-    def _extract_carpet_info(self, start_pos, new_carpet_mask):
-        best_direction = None
-        best_length = 0
-
-        for direction in (
-            enums.Direction.UP,
-            enums.Direction.DOWN,
-            enums.Direction.LEFT,
-            enums.Direction.RIGHT,
-        ):
-            mask = 1 << (start_pos[1] * BS + start_pos[0])
-            length = 0
-            for _ in range(BS - 1):
-                mask = self._shift_mask(direction, mask)
-                if not mask:
-                    break
-                if mask & new_carpet_mask:
-                    length += 1
-                else:
-                    break
-
-            if length > best_length:
-                best_length = length
-                best_direction = direction
-
-        if best_length > 0:
-            return best_direction, best_length
-        return None, 0
-
-    def _find_blocking_prime_target(self, board):
-        if self._opponent_carpet_direction is None:
-            return None
-        if self._opponent_pattern_age > 2:
-            return None
-
-        opp_pos = board.opponent_worker.get_location()
-        cur = opp_pos
-
-        for _ in range(BS - 1):
-            cur = enums.loc_after_direction(cur, self._opponent_carpet_direction)
-            if not self._in_bounds(cur):
+                value, chosen = self._search_root(
+                    board,
+                    self.belief,
+                    ordered_moves,
+                    depth,
+                    deadline,
+                    time_left,
+                )
+            except TimeoutError:
                 break
+            if chosen is not None:
+                best_move = chosen
+                best_value = value
+                completed_depth = depth
+                ordered_moves = self._promote_best_move(ordered_moves, chosen)
 
-            cell = board.get_cell(cur)
+        if completed_depth == 0:
+            best_move = ordered_moves[0]
 
-            if cell == enums.Cell.BLOCKED:
-                break
-            if cell == enums.Cell.SPACE:
-                return cur
-            # If primed or carpeted, continue scanning.
+        self.turn_depths.append(completed_depth)
+        self.max_depth_reached = max(self.max_depth_reached, completed_depth)
+        self.turn_times.append(max(0.0, start_remaining - time_left()))
+        self.last_turn_seen = board.turn_count
+        return best_move
 
-        return None
+    def _build_sparse_transitions(
+        self, transition_matrix
+    ) -> List[List[Tuple[int, float]]]:
+        transitions: List[List[Tuple[int, float]]] = []
+        for i in range(CELL_COUNT):
+            row = []
+            for j in range(CELL_COUNT):
+                prob = float(transition_matrix[i][j])
+                if prob > 0.0:
+                    row.append((j, prob))
+            if not row:
+                row.append((i, 1.0))
+            transitions.append(row)
+        return transitions
 
-    # ----------------------------
-    # Belief logic
-    # ----------------------------
-
-    def _compute_spawn_prior(self):
-        if self.T is None:
-            return [1.0 / NC] * NC
-
-        belief = [0.0] * NC
+    def _compute_headstart_prior(self) -> List[float]:
+        belief = [0.0] * CELL_COUNT
         belief[0] = 1.0
         for _ in range(1000):
-            belief = self._matvec(belief)
-        self._normalize_in_place(belief)
+            belief = self._advance_belief_once(belief)
         return belief
 
-    def _predict_one_step(self):
-        if self.T is None:
-            return
-        self.belief = self._matvec(self.belief)
-        self._normalize_in_place(self.belief)
+    def _precompute_distance_likelihoods(self) -> List[List[List[float]]]:
+        likelihoods: List[List[List[float]]] = []
+        for worker_idx in range(CELL_COUNT):
+            wx, wy = self._idx_to_pos(worker_idx)
+            per_observation = []
+            for observed in range(MAX_DISTANCE_OBS + 1):
+                row = [0.0] * CELL_COUNT
+                for rat_idx in range(CELL_COUNT):
+                    rx, ry = self._idx_to_pos(rat_idx)
+                    actual = abs(wx - rx) + abs(wy - ry)
+                    p = 0.0
+                    for offset, prob in zip(
+                        DISTANCE_ERROR_OFFSETS, DISTANCE_ERROR_PROBS
+                    ):
+                        estimate = actual + offset
+                        if estimate < 0:
+                            estimate = 0
+                        if estimate == observed:
+                            p += prob
+                    row[rat_idx] = p
+                per_observation.append(row)
+            likelihoods.append(per_observation)
+        return likelihoods
 
-    def _observe(self, board, noise_obs, reported_dist):
-        my_loc = self._my_loc(board)
+    def _synchronize_belief(self, board: game_board.Board, sensor_data: Tuple):
+        if board.turn_count == 0 and self.last_turn_seen == -1:
+            self.belief = list(self.search_prior)
 
-        for idx in range(NC):
-            x, y = idx % BS, idx // BS
+        self._apply_search_feedback(board.player_search)
+        self._apply_search_feedback(board.opponent_search)
 
-            cell_type = board.get_cell((x, y))
-            noise_likelihoods = NOISE_PROBS.get(
-                cell_type, NOISE_PROBS[enums.Cell.SPACE]
-            )
-            noise_likelihood = noise_likelihoods[noise_obs.value]
+        noise_obs, distance_obs = sensor_data
+        predicted = self._advance_belief_once(self.belief)
+        worker_idx = self._pos_to_idx(board.player_worker.get_location())
+        distance_obs = int(max(0, min(MAX_DISTANCE_OBS, distance_obs)))
+        distance_row = self.distance_likelihood[worker_idx][distance_obs]
+        updated = [0.0] * CELL_COUNT
+        total = 0.0
+        for idx, prior in enumerate(predicted):
+            if prior <= 0.0:
+                continue
+            cell_prob = NOISE_PROBS[board.get_cell(self._idx_to_pos(idx))][
+                int(noise_obs)
+            ]
+            value = prior * cell_prob * distance_row[idx]
+            updated[idx] = value
+            total += value
 
-            actual_dist = abs(x - my_loc[0]) + abs(y - my_loc[1])
-            dist_likelihood = self._distance_likelihood(actual_dist, reported_dist)
-
-            self.belief[idx] *= noise_likelihood * dist_likelihood
-
-        if sum(self.belief) <= EPS:
-            self.belief = self.base_prior[:]
+        if total <= 0.0:
+            self.belief = list(predicted)
+            self._normalize(self.belief)
         else:
-            self._normalize_in_place(self.belief)
+            inv_total = 1.0 / total
+            self.belief = [value * inv_total for value in updated]
 
-    def _distance_likelihood(self, actual_dist, reported_dist):
-        p = 0.0
-        for prob, off in zip(DIST_ERROR_PROBS, DIST_OFFSETS):
-            shown = max(0, actual_dist + off)
-            if shown == reported_dist:
-                p += prob
-        return p
+        self.last_player_search = board.player_search
+        self.last_opponent_search = board.opponent_search
 
-    def _apply_search_evidence(self, board):
-        my_info = self._extract_search_info(
-            board,
-            [
-                "player_search",
-                "your_search_location_and_result",
-                "player_search_location_and_result",
-                "my_search_location_and_result",
-                "your_search_info",
-                "player_search_info",
-            ],
-        )
-        opp_info = self._extract_search_info(
-            board,
-            [
-                "opponent_search",
-                "opponent_search_location_and_result",
-                "enemy_search_location_and_result",
-                "opp_search_location_and_result",
-                "opponent_search_info",
-            ],
-        )
-
-        signature = (my_info, opp_info)
-        if signature == self._last_search_signature:
+    def _apply_search_feedback(self, search_info: Tuple):
+        loc, result = search_info
+        if loc is None:
             return
-        self._last_search_signature = signature
+        if (
+            search_info == self.last_player_search
+            or search_info == self.last_opponent_search
+        ):
+            return
+        idx = self._pos_to_idx(loc)
+        if result:
+            self.belief = list(self.search_prior)
+            return
+        self.belief[idx] = 0.0
+        if sum(self.belief) <= 0.0:
+            self.belief = list(self.search_prior)
+            return
+        self._normalize(self.belief)
 
-        for loc, success in (my_info, opp_info):
-            if loc is not None and success:
-                self.belief = self.base_prior[:]
-                return
+    def _advance_belief_once(self, belief: Sequence[float]) -> List[float]:
+        nxt = [0.0] * CELL_COUNT
+        for src_idx, src_prob in enumerate(belief):
+            if src_prob <= 0.0:
+                continue
+            for dst_idx, prob in self.transitions[src_idx]:
+                nxt[dst_idx] += src_prob * prob
+        return nxt
 
-        changed = False
-        for loc, success in (my_info, opp_info):
-            if loc is not None and not success:
-                idx = self._idx(loc)
-                if 0 <= idx < NC and self.belief[idx] > 0.0:
-                    self.belief[idx] = 0.0
-                    changed = True
+    def _candidate_search_moves(self, board: game_board.Board) -> List[move.Move]:
+        top_cells = sorted(
+            range(CELL_COUNT), key=lambda idx: self.belief[idx], reverse=True
+        )[:5]
+        searches = []
+        for idx in top_cells:
+            p = self.belief[idx]
+            if p <= 0.12 and searches:
+                continue
+            searches.append(move.Move.search(self._idx_to_pos(idx)))
+        return searches
 
-        if changed:
-            if sum(self.belief) <= EPS:
-                self.belief = self.base_prior[:]
-            else:
-                self._normalize_in_place(self.belief)
+    def _ordered_root_moves(
+        self,
+        board: game_board.Board,
+        legal_moves: List[move.Move],
+        candidate_searches: List[move.Move],
+    ) -> List[move.Move]:
+        moves = list(legal_moves)
+        moves.extend(candidate_searches)
+        scored = [(self._move_heuristic(board, mv, self.belief), mv) for mv in moves]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [mv for _, mv in scored]
 
-    def _extract_search_info(self, board, candidate_names):
-        value = None
-        for name in candidate_names:
-            if hasattr(board, name):
-                value = getattr(board, name)
+    def _search_root(
+        self,
+        board: game_board.Board,
+        belief: Sequence[float],
+        ordered_moves: Sequence[move.Move],
+        depth: int,
+        deadline: float,
+        time_left: Callable,
+    ) -> Tuple[float, move.Move | None]:
+        alpha = -inf
+        beta = inf
+        best_move = None
+        best_value = -inf
+        for mv in ordered_moves:
+            if time_left() <= deadline:
+                raise TimeoutError
+            child_board, child_belief = self._simulate_action(board, belief, mv)
+            if child_board is None:
+                continue
+            child_board.reverse_perspective()
+            value = -self._negamax(
+                child_board,
+                child_belief,
+                depth - 1,
+                -beta,
+                -alpha,
+                deadline,
+                time_left,
+            )
+            if value > best_value:
+                best_value = value
+                best_move = mv
+            if value > alpha:
+                alpha = value
+        return best_value, best_move
+
+    def _negamax(
+        self,
+        board: game_board.Board,
+        belief: Sequence[float],
+        depth: int,
+        alpha: float,
+        beta: float,
+        deadline: float,
+        time_left: Callable,
+    ) -> float:
+        if time_left() <= deadline:
+            raise TimeoutError
+
+        self.nodes += 1
+        if depth <= 0 or board.is_game_over():
+            return self._evaluate(board, belief)
+
+        key = self._transposition_key(board, belief)
+        cached = self.ttable.get(key)
+        if cached is not None and cached[0] >= depth:
+            return cached[1]
+
+        legal_moves = board.get_valid_moves()
+        search_moves = self._candidate_searches_for_belief(belief)
+        all_moves = self._order_moves_for_node(board, belief, legal_moves, search_moves)
+        if not all_moves:
+            return self._evaluate(board, belief)
+
+        best_value = -inf
+        local_alpha = alpha
+        for mv in all_moves:
+            child_board, child_belief = self._simulate_action(board, belief, mv)
+            if child_board is None:
+                continue
+            child_board.reverse_perspective()
+            value = -self._negamax(
+                child_board,
+                child_belief,
+                depth - 1,
+                -beta,
+                -local_alpha,
+                deadline,
+                time_left,
+            )
+            if value > best_value:
+                best_value = value
+            if value > local_alpha:
+                local_alpha = value
+            if local_alpha >= beta:
+                self.cutoffs += 1
                 break
 
-        if value is None:
-            return (None, False)
+        self.ttable[key] = (depth, best_value)
+        return best_value
 
-        if callable(value):
-            try:
-                value = value()
-            except Exception:
-                return (None, False)
+    def _order_moves_for_node(
+        self,
+        board: game_board.Board,
+        belief: Sequence[float],
+        legal_moves: List[move.Move],
+        search_moves: List[move.Move],
+    ) -> List[move.Move]:
+        moves = list(legal_moves)
+        moves.extend(search_moves)
+        moves.sort(key=lambda mv: self._move_heuristic(board, mv, belief), reverse=True)
+        return moves[:14]
 
-        if (
-            isinstance(value, tuple)
-            and len(value) == 2
-            and (value[0] is None or isinstance(value[0], tuple))
-            and isinstance(value[1], bool)
-        ):
-            return value
+    def _simulate_action(
+        self,
+        board: game_board.Board,
+        belief: Sequence[float],
+        mv: move.Move,
+    ) -> Tuple[game_board.Board | None, List[float]]:
+        child = board.forecast_move(mv)
+        if child is None:
+            return None, list(belief)
 
-        return (None, False)
+        next_belief = list(belief)
+        if mv.move_type == enums.MoveType.SEARCH:
+            idx = self._pos_to_idx(mv.search_loc)
+            p = belief[idx]
+            child.player_worker.points += 6.0 * p - 2.0
+            failed = list(belief)
+            failed[idx] = 0.0
+            if sum(failed) <= 0.0:
+                failed = list(self.search_prior)
+            else:
+                self._normalize(failed)
+            next_belief = [
+                p * self.search_prior[i] + (1.0 - p) * failed[i]
+                for i in range(CELL_COUNT)
+            ]
 
-    # ----------------------------
-    # Board features
-    # ----------------------------
+        next_belief = self._advance_belief_once(next_belief)
+        return child, next_belief
 
-    def _best_future_carpet_points(self, board, loc):
-        best = 0
-        for direction in (
-            enums.Direction.UP,
-            enums.Direction.DOWN,
-            enums.Direction.LEFT,
-            enums.Direction.RIGHT,
-        ):
-            run = self._primed_run_from_adjacent(board, loc, direction)
-            best = max(best, enums.CARPET_POINTS_TABLE.get(run, 0))
-        return best
+    def _evaluate(self, board: game_board.Board, belief: Sequence[float]) -> float:
+        if board.get_winner() == enums.Result.PLAYER:
+            return 100000.0
+        if board.get_winner() == enums.Result.ENEMY:
+            return -100000.0
+        if board.get_winner() == enums.Result.TIE:
+            return 0.0
 
-    def _primed_run_from_adjacent(self, board, loc, direction):
-        nxt = enums.loc_after_direction(loc, direction)
-        if not self._in_bounds(nxt):
-            return 0
-        if board.get_cell(nxt) != enums.Cell.PRIMED:
-            return 0
+        my_points = float(board.player_worker.get_points())
+        opp_points = float(board.opponent_worker.get_points())
+        score = 28.0 * (my_points - opp_points)
 
-        run = 0
-        cur = nxt
-        while self._in_bounds(cur) and board.get_cell(cur) == enums.Cell.PRIMED:
-            run += 1
-            cur = enums.loc_after_direction(cur, direction)
-        return run
+        my_moves = board.get_valid_moves()
+        opp_moves = board.get_valid_moves(enemy=True)
+        score += 1.4 * (len(my_moves) - len(opp_moves))
 
-    def _adjacent_space_count(self, board, loc):
+        my_best_carpet, my_prime_count = self._line_features(board, enemy=False)
+        opp_best_carpet, opp_prime_count = self._line_features(board, enemy=True)
+        score += 7.0 * (
+            CARPET_VALUES.get(my_best_carpet, 0) - CARPET_VALUES.get(opp_best_carpet, 0)
+        )
+        score += 1.1 * (my_prime_count - opp_prime_count)
+
+        score += 2.0 * (
+            self._future_carpet_potential(board, False)
+            - self._future_carpet_potential(board, True)
+        )
+        score += 8.0 * (
+            self._best_search_ev(belief) - self._best_search_ev_for_enemy(board, belief)
+        )
+        score += 0.8 * (
+            self._expected_distance_term(board, belief, False)
+            - self._expected_distance_term(board, belief, True)
+        )
+
+        return score
+
+    def _line_features(self, board: game_board.Board, enemy: bool) -> Tuple[int, int]:
+        worker = board.opponent_worker if enemy else board.player_worker
+        loc = worker.get_location()
+        best_carpet = 0
+        prime_count = 0
+        if board.get_cell(loc) == enums.Cell.SPACE:
+            prime_count += 1
+        for direction in DIRS:
+            current = loc
+            run = 0
+            while True:
+                current = enums.loc_after_direction(current, direction)
+                if not board.is_valid_cell(current):
+                    break
+                if board.is_cell_carpetable(current):
+                    run += 1
+                    prime_count += 1
+                else:
+                    break
+            if run > best_carpet:
+                best_carpet = run
+        return best_carpet, prime_count
+
+    def _future_carpet_potential(self, board: game_board.Board, enemy: bool) -> float:
+        worker = board.opponent_worker if enemy else board.player_worker
+        loc = worker.get_location()
+        if board.get_cell(loc) != enums.Cell.SPACE:
+            return 0.0
+        best_after_prime = 0
+        for direction in DIRS:
+            current = enums.loc_after_direction(loc, direction)
+            if board.is_cell_blocked(current):
+                continue
+            run = 0
+            while board.is_valid_cell(current) and board.is_cell_carpetable(current):
+                run += 1
+                current = enums.loc_after_direction(current, direction)
+            best_after_prime = max(best_after_prime, run + 1)
+        return float(CARPET_VALUES.get(best_after_prime, 0))
+
+    def _best_search_ev(self, belief: Sequence[float]) -> float:
+        return max((6.0 * p - 2.0 for p in belief), default=-2.0)
+
+    def _best_search_ev_for_enemy(
+        self, board: game_board.Board, belief: Sequence[float]
+    ) -> float:
+        _ = board
+        return self._best_search_ev(belief)
+
+    def _expected_distance_term(
+        self, board: game_board.Board, belief: Sequence[float], enemy: bool
+    ) -> float:
+        worker = board.opponent_worker if enemy else board.player_worker
+        wx, wy = worker.get_location()
+        total = 0.0
+        for idx, prob in enumerate(belief):
+            if prob <= 0.0:
+                continue
+            rx, ry = self._idx_to_pos(idx)
+            total += prob * (14 - abs(wx - rx) - abs(wy - ry))
+        return total
+
+    def _candidate_searches_for_belief(
+        self, belief: Sequence[float]
+    ) -> List[move.Move]:
+        top_cells = sorted(
+            range(CELL_COUNT), key=lambda idx: belief[idx], reverse=True
+        )[:3]
+        return [
+            move.Move.search(self._idx_to_pos(idx))
+            for idx in top_cells
+            if belief[idx] > 0.08
+        ]
+
+    def _move_heuristic(
+        self, board: game_board.Board, mv: move.Move, belief: Sequence[float]
+    ) -> float:
+        if mv.move_type == enums.MoveType.SEARCH:
+            return 1000.0 + 120.0 * belief[self._pos_to_idx(mv.search_loc)]
+        if mv.move_type == enums.MoveType.CARPET:
+            return 700.0 + 100.0 * CARPET_VALUES[mv.roll_length] + 15.0 * mv.roll_length
+        if mv.move_type == enums.MoveType.PRIME:
+            dest = enums.loc_after_direction(
+                board.player_worker.get_location(), mv.direction
+            )
+            return 350.0 + 25.0 * self._open_neighbors(board, dest)
+        dest = enums.loc_after_direction(
+            board.player_worker.get_location(), mv.direction
+        )
+        return (
+            100.0
+            + 6.0 * self._open_neighbors(board, dest)
+            + 12.0 * self._belief_mass_near(dest, belief)
+        )
+
+    def _open_neighbors(self, board: game_board.Board, loc: Tuple[int, int]) -> int:
         count = 0
-        for direction in (
-            enums.Direction.UP,
-            enums.Direction.DOWN,
-            enums.Direction.LEFT,
-            enums.Direction.RIGHT,
-        ):
+        for direction in DIRS:
             nxt = enums.loc_after_direction(loc, direction)
-            if self._in_bounds(nxt) and board.get_cell(nxt) == enums.Cell.SPACE:
+            if not board.is_cell_blocked(nxt):
                 count += 1
         return count
 
-    def _end_loc(self, start_loc, m):
-        move_type = getattr(m, "move_type", None)
-        direction = getattr(m, "direction", None)
+    def _belief_mass_near(self, loc: Tuple[int, int], belief: Sequence[float]) -> float:
+        x, y = loc
+        total = 0.0
+        for idx, prob in enumerate(belief):
+            if prob <= 0.0:
+                continue
+            rx, ry = self._idx_to_pos(idx)
+            dist = abs(x - rx) + abs(y - ry)
+            total += prob * max(0, 4 - dist)
+        return total
 
-        if direction is None:
-            return start_loc
-
-        steps = (
-            getattr(m, "roll_length", 1) if move_type == enums.MoveType.CARPET else 1
+    def _transposition_key(
+        self, board: game_board.Board, belief: Sequence[float]
+    ) -> Tuple:
+        top = sorted(range(CELL_COUNT), key=lambda idx: belief[idx], reverse=True)[:3]
+        belief_sig = tuple((idx, round(belief[idx], 3)) for idx in top)
+        return (
+            board._primed_mask,
+            board._carpet_mask,
+            board._blocked_mask,
+            board.player_worker.position,
+            board.opponent_worker.position,
+            board.player_worker.turns_left,
+            board.opponent_worker.turns_left,
+            board.is_player_a_turn,
+            belief_sig,
         )
 
-        loc = start_loc
-        for _ in range(steps):
-            loc = enums.loc_after_direction(loc, direction)
-        return loc
+    def _turn_budget(self, board: game_board.Board, remaining_time: float) -> float:
+        turns_left = max(1, board.player_worker.turns_left)
+        reserve = 12.0 if remaining_time > 40.0 else 5.0
+        spendable = max(0.2, remaining_time - reserve)
+        base = spendable / turns_left
+        if board.turn_count < 16:
+            boost = 2.3
+        elif board.turn_count < 48:
+            boost = 1.8
+        else:
+            boost = 1.3
+        return min(16.0, max(1.0, base * boost))
 
-    def _search_target(self, m):
-        for attr in (
-            "search_loc",
-            "location",
-            "target",
-            "search_location",
-            "guess_location",
-            "loc",
-        ):
-            if hasattr(m, attr):
-                value = getattr(m, attr)
-                if isinstance(value, tuple) and len(value) == 2:
-                    return value
-        return None
+    def _promote_best_move(
+        self, moves: Sequence[move.Move], best_move: move.Move
+    ) -> List[move.Move]:
+        promoted = [best_move]
+        for mv in moves:
+            if mv is not best_move:
+                promoted.append(mv)
+        return promoted
 
-    # ----------------------------
-    # Belief features
-    # ----------------------------
+    def _best_belief_cell(self) -> Tuple[int, int]:
+        best_idx = max(range(CELL_COUNT), key=lambda idx: self.belief[idx])
+        return self._idx_to_pos(best_idx)
 
-    def _belief_at(self, loc):
-        if not self._in_bounds(loc):
-            return 0.0
-        return self.belief[self._idx(loc)]
-
-    def _local_mass(self, center, radius):
-        total = 0.0
-        for y in range(BS):
-            for x in range(BS):
-                if abs(x - center[0]) + abs(y - center[1]) <= radius:
-                    total += self.belief[self._idx((x, y))]
-        return total
-
-    def _expected_distance(self, loc):
-        total = 0.0
-        for idx, p in enumerate(self.belief):
-            if p <= 0.0:
-                continue
-            x, y = idx % BS, idx // BS
-            total += p * self._manhattan(loc, (x, y))
-        return total
-
-    def _top_mass(self, k):
-        return sum(sorted(self.belief, reverse=True)[:k])
-
-    # ----------------------------
-    # Generic helpers
-    # ----------------------------
-
-    def _matvec(self, vec):
-        if self.T is None:
-            return [1.0 / NC] * NC
-        out = [0.0] * NC
-        for i, bi in enumerate(vec):
-            if bi <= EPS:
-                continue
-            row = self.T[i]
-            for j, pij in enumerate(row):
-                if pij > 0.0:
-                    out[j] += bi * pij
-        return out
-
-    def _normalize_in_place(self, vec):
-        s = sum(vec)
-        if s <= EPS:
+    def _normalize(self, vec: List[float]):
+        total = sum(vec)
+        if total <= 0.0:
+            uniform = 1.0 / CELL_COUNT
+            for idx in range(CELL_COUNT):
+                vec[idx] = uniform
             return
-        inv = 1.0 / s
-        for i in range(len(vec)):
-            vec[i] *= inv
+        inv_total = 1.0 / total
+        for idx in range(CELL_COUNT):
+            vec[idx] *= inv_total
 
-    def _my_loc(self, board):
-        worker = board.player_worker
-        if hasattr(worker, "get_location"):
-            return worker.get_location()
-        return worker.location
+    def _pos_to_idx(self, loc: Tuple[int, int]) -> int:
+        return loc[1] * BOARD_SIZE + loc[0]
 
-    def _turns_remaining(self, board):
-        worker = board.player_worker
-        for attr in ("turns_remaining", "turns_left"):
-            if hasattr(worker, attr):
-                return getattr(worker, attr)
-        return 40
-
-    def _idx(self, loc):
-        return loc[1] * BS + loc[0]
-
-    def _in_bounds(self, loc):
-        return 0 <= loc[0] < BS and 0 <= loc[1] < BS
-
-    def _manhattan(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def _shift_mask(self, direction, mask):
-        if direction == enums.Direction.UP:
-            return (mask >> BS) & 0x00FFFFFFFFFFFFFF
-        if direction == enums.Direction.DOWN:
-            return (mask << BS) & 0xFFFFFFFFFFFFFF00
-        if direction == enums.Direction.LEFT:
-            return (mask >> 1) & 0x7F7F7F7F7F7F7F7F
-        if direction == enums.Direction.RIGHT:
-            return (mask << 1) & 0xFEFEFEFEFEFEFEFE
-        return 0
+    def _idx_to_pos(self, idx: int) -> Tuple[int, int]:
+        return (idx % BOARD_SIZE, idx // BOARD_SIZE)
