@@ -1,5 +1,5 @@
 ### Best (So Far):
-Lincoln
+Bush
 
 ### Run One Game:
 python3 engine/run_local_agents.py <agent1> <agent2>
