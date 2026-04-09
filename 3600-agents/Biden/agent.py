@@ -83,10 +83,9 @@ class PlayerAgent:
         best_move = ordered_moves[0]
         best_value = -inf
         completed_depth = 0
-        max_depth = self._max_search_depth(board, ordered_moves)
         self.ttable.clear()
 
-        for depth in range(1, max_depth + 1):
+        for depth in range(1, 16):
             if time_left() <= max(0.02, deadline):
                 break
             try:
@@ -270,11 +269,10 @@ class PlayerAgent:
             if child_board is None:
                 continue
             child_board.reverse_perspective()
-            next_depth = depth - 1 + self._extension_bonus(board, belief, mv, depth)
             value = -self._negamax(
                 child_board,
                 child_belief,
-                next_depth,
+                depth - 1,
                 -beta,
                 -alpha,
                 deadline,
@@ -322,11 +320,10 @@ class PlayerAgent:
             if child_board is None:
                 continue
             child_board.reverse_perspective()
-            next_depth = depth - 1 + self._extension_bonus(board, belief, mv, depth)
             value = -self._negamax(
                 child_board,
                 child_belief,
-                next_depth,
+                depth - 1,
                 -beta,
                 -local_alpha,
                 deadline,
@@ -394,16 +391,7 @@ class PlayerAgent:
 
         my_points = float(board.player_worker.get_points())
         opp_points = float(board.opponent_worker.get_points())
-        turns_left = board.player_worker.turns_left
-        point_margin = my_points - opp_points
-        late_game = turns_left <= 10
-        closing_game = turns_left <= 6
-
-        score = 28.0 * point_margin
-        if late_game:
-            score += 10.0 * point_margin
-        if closing_game:
-            score += 12.0 * point_margin
+        score = 28.0 * (my_points - opp_points)
 
         my_moves = board.get_valid_moves()
         opp_moves = board.get_valid_moves(enemy=True)
@@ -425,30 +413,6 @@ class PlayerAgent:
             self._expected_distance_term(board, belief, False)
             - self._expected_distance_term(board, belief, True)
         )
-
-        my_now = self._best_immediate_carpet_points(board, False)
-        opp_now = self._best_immediate_carpet_points(board, True)
-        my_soon = self._future_carpet_potential(board, False)
-        opp_soon = self._future_carpet_potential(board, True)
-        block_dist = self._block_distance_to_enemy_lane(board)
-
-        score += 3.0 * (my_now - opp_now)
-        score += 1.6 * (my_soon - opp_soon)
-
-        if late_game:
-            score += 9.0 * my_now
-            score -= 15.0 * opp_now
-            score -= 4.5 * opp_soon
-            if block_dist is not None:
-                score -= 1.8 * block_dist
-            if point_margin > 0:
-                score -= 6.0 * max(0.0, opp_now - my_now)
-            else:
-                score += 3.0 * self._best_search_ev(belief)
-
-        if closing_game:
-            score += 6.0 * my_soon
-            score -= 10.0 * opp_soon
 
         return score
 
@@ -492,42 +456,6 @@ class PlayerAgent:
             best_after_prime = max(best_after_prime, run + 1)
         return float(CARPET_VALUES.get(best_after_prime, 0))
 
-    def _best_immediate_carpet_points(
-        self, board: game_board.Board, enemy: bool
-    ) -> float:
-        worker = board.opponent_worker if enemy else board.player_worker
-        loc = worker.get_location()
-        best_points = 0.0
-        for direction in DIRS:
-            current = loc
-            run = 0
-            while True:
-                current = enums.loc_after_direction(current, direction)
-                if not board.is_valid_cell(current) or not board.is_cell_carpetable(
-                    current
-                ):
-                    break
-                run += 1
-            best_points = max(best_points, float(CARPET_VALUES.get(run, 0)))
-        return best_points
-
-    def _block_distance_to_enemy_lane(self, board: game_board.Board) -> int | None:
-        opp_loc = board.opponent_worker.get_location()
-        my_loc = board.player_worker.get_location()
-        best_distance = None
-        for direction in DIRS:
-            current = opp_loc
-            while True:
-                current = enums.loc_after_direction(current, direction)
-                if not board.is_valid_cell(current) or not board.is_cell_carpetable(
-                    current
-                ):
-                    break
-                distance = abs(my_loc[0] - current[0]) + abs(my_loc[1] - current[1])
-                if best_distance is None or distance < best_distance:
-                    best_distance = distance
-        return best_distance
-
     def _best_search_ev(self, belief: Sequence[float]) -> float:
         return max((6.0 * p - 2.0 for p in belief), default=-2.0)
 
@@ -562,149 +490,24 @@ class PlayerAgent:
         if mv.move_type == enums.MoveType.SEARCH:
             p = belief[self._pos_to_idx(mv.search_loc)]
             ev = 6.0 * p - 2.0
-            turns_left = board.player_worker.turns_left
-            my_now = self._best_immediate_carpet_points(board, False)
-            opp_now = self._best_immediate_carpet_points(board, True)
             if ev > 0.0:
-                score = 1200.0 + 1400.0 * ev + 400.0 * p
-            else:
-                score = 120.0 + 250.0 * p + 80.0 * ev
-            if turns_left <= 10:
-                score -= 160.0 * max(my_now, opp_now)
-                if opp_now >= 6.0:
-                    score -= 300.0
-                elif my_now >= 6.0:
-                    score -= 180.0
-                if turns_left <= 6 and ev < 1.2:
-                    score -= 220.0
-            return score
+                return 1200.0 + 1400.0 * ev + 400.0 * p
+            return 120.0 + 250.0 * p + 80.0 * ev
         if mv.move_type == enums.MoveType.CARPET:
-            score = (
-                700.0 + 100.0 * CARPET_VALUES[mv.roll_length] + 15.0 * mv.roll_length
-            )
-            if mv.roll_length >= 4:
-                score += 180.0 + 40.0 * mv.roll_length
-            opp_now = self._best_immediate_carpet_points(board, True)
-            if CARPET_VALUES[mv.roll_length] >= opp_now and opp_now >= 4.0:
-                score += 120.0
-            return score
+            return 700.0 + 100.0 * CARPET_VALUES[mv.roll_length] + 15.0 * mv.roll_length
         if mv.move_type == enums.MoveType.PRIME:
             dest = enums.loc_after_direction(
                 board.player_worker.get_location(), mv.direction
             )
-            future_points = self._future_carpet_points_from(board, dest)
-            block_bonus = self._prime_block_bonus(board, dest)
-            return (
-                350.0
-                + 25.0 * self._open_neighbors(board, dest)
-                + 22.0 * future_points
-                + block_bonus
-            )
+            return 350.0 + 25.0 * self._open_neighbors(board, dest)
         dest = enums.loc_after_direction(
             board.player_worker.get_location(), mv.direction
         )
-        block_bonus = self._plain_block_bonus(board, dest)
         return (
             100.0
             + 6.0 * self._open_neighbors(board, dest)
             + 12.0 * self._belief_mass_near(dest, belief)
-            + block_bonus
         )
-
-    def _max_search_depth(
-        self, board: game_board.Board, ordered_moves: Sequence[move.Move]
-    ) -> int:
-        base_depth = 15
-        if len(ordered_moves) <= 1:
-            return base_depth
-        first = self._move_heuristic(board, ordered_moves[0], self.belief)
-        second = self._move_heuristic(board, ordered_moves[1], self.belief)
-        gap = first - second
-        if gap <= 60.0:
-            return 17
-        if gap <= 120.0:
-            return 16
-        if gap >= 260.0:
-            return 13
-        return base_depth
-
-    def _extension_bonus(
-        self,
-        board: game_board.Board,
-        belief: Sequence[float],
-        mv: move.Move,
-        depth: int,
-    ) -> int:
-        if depth <= 0:
-            return 0
-        if mv.move_type == enums.MoveType.CARPET and mv.roll_length >= 4:
-            return 1
-        if mv.move_type == enums.MoveType.SEARCH:
-            p = belief[self._pos_to_idx(mv.search_loc)]
-            if p >= 0.45:
-                return 1
-            return 0
-        if mv.move_type == enums.MoveType.PRIME:
-            dest = enums.loc_after_direction(
-                board.player_worker.get_location(), mv.direction
-            )
-            if self._future_carpet_points_from(board, dest) >= 6.0:
-                return 1
-        if mv.move_type == enums.MoveType.PLAIN:
-            dest = enums.loc_after_direction(
-                board.player_worker.get_location(), mv.direction
-            )
-            if self._plain_block_bonus(board, dest) >= 90.0:
-                return 1
-        return 0
-
-    def _future_carpet_points_from(
-        self, board: game_board.Board, loc: Tuple[int, int]
-    ) -> float:
-        if not board.is_valid_cell(loc) or board.get_cell(loc) != enums.Cell.SPACE:
-            return 0.0
-        best_after_prime = 0
-        for direction in DIRS:
-            current = enums.loc_after_direction(loc, direction)
-            run = 0
-            while board.is_valid_cell(current) and board.is_cell_carpetable(current):
-                run += 1
-                current = enums.loc_after_direction(current, direction)
-            best_after_prime = max(best_after_prime, run + 1)
-        return float(CARPET_VALUES.get(best_after_prime, 0))
-
-    def _enemy_lane_cells(self, board: game_board.Board) -> List[Tuple[int, int]]:
-        opp_loc = board.opponent_worker.get_location()
-        cells: List[Tuple[int, int]] = []
-        for direction in DIRS:
-            current = opp_loc
-            while True:
-                current = enums.loc_after_direction(current, direction)
-                if not board.is_valid_cell(current) or not board.is_cell_carpetable(
-                    current
-                ):
-                    break
-                cells.append(current)
-        return cells
-
-    def _plain_block_bonus(
-        self, board: game_board.Board, dest: Tuple[int, int]
-    ) -> float:
-        lane_cells = self._enemy_lane_cells(board)
-        if not lane_cells:
-            return 0.0
-        if dest in lane_cells:
-            return 150.0
-        best_dist = min(abs(dest[0] - x) + abs(dest[1] - y) for x, y in lane_cells)
-        return max(0.0, 80.0 - 20.0 * best_dist)
-
-    def _prime_block_bonus(
-        self, board: game_board.Board, dest: Tuple[int, int]
-    ) -> float:
-        lane_cells = self._enemy_lane_cells(board)
-        if dest in lane_cells:
-            return 110.0
-        return 0.0
 
     def _open_neighbors(self, board: game_board.Board, loc: Tuple[int, int]) -> int:
         count = 0
@@ -755,39 +558,19 @@ class PlayerAgent:
             reserve = 5.0
         spendable = max(0.2, remaining_time - reserve)
         base = spendable / turns_left
-        if my_turn_index == 0:
-            boost = 0.20
-        elif my_turn_index == 1:
-            boost = 0.38
-        elif my_turn_index == 2:
-            boost = 0.52
-        elif my_turn_index < 8:
-            boost = 0.90
+        if my_turn_index < 8:
+            boost = 0.95
         elif my_turn_index < 24:
             boost = 1.3
         else:
             boost = 1.05
         if self._best_search_ev(self.belief) > 0.8:
             boost += 0.15
-        if turns_left <= 10:
-            boost += 0.20
-        if turns_left <= 6:
-            boost += 0.10
         return min(10.0, max(0.75, base * boost))
 
     def _root_move_limit(self, board: game_board.Board) -> int:
         my_turn_index = 40 - board.player_worker.turns_left
-        if my_turn_index == 0:
-            return 4
-        if my_turn_index == 1:
-            return 5
-        if my_turn_index == 2:
-            return 6
         if my_turn_index < 8:
-            return 7
-        if board.player_worker.turns_left <= 6:
-            return 7
-        if board.player_worker.turns_left <= 10:
             return 8
         if my_turn_index < 24:
             return 12
@@ -795,18 +578,8 @@ class PlayerAgent:
 
     def _node_move_limit(self, board: game_board.Board) -> int:
         my_turn_index = 40 - board.player_worker.turns_left
-        if my_turn_index == 0:
-            return 3
-        if my_turn_index == 1:
-            return 4
-        if my_turn_index == 2:
-            return 5
         if my_turn_index < 8:
-            return 6
-        if board.player_worker.turns_left <= 6:
-            return 5
-        if board.player_worker.turns_left <= 10:
-            return 6
+            return 7
         if my_turn_index < 24:
             return 10
         return 9
