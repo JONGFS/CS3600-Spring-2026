@@ -304,6 +304,19 @@ class PlayerAgent:
         belief: Sequence[float],
     ) -> move.Move | None:
         threat = self._best_enemy_immediate_carpet_points(board)
+
+        best_cash = self._best_cash_now_move(board, legal_moves)
+        if best_cash is not None:
+            pts = float(CARPET_VALUES[best_cash.roll_length])
+            if pts >= 10.0 or self._is_contested_cash_move(board, best_cash):
+                return best_cash
+            if threat >= 6.0 and pts >= 4.0:
+                denied_now, denied_total, after_now, _ = self._move_denial_delta(
+                    board, best_cash
+                )
+                if denied_now >= 2.0 or after_now <= max(0.0, threat - 2.0):
+                    return best_cash
+
         best_carpet = self._best_counter_carpet_move(board, legal_moves)
         if best_carpet is not None:
             best_carpet_pts = float(CARPET_VALUES[best_carpet.roll_length])
@@ -311,7 +324,7 @@ class PlayerAgent:
                 return best_carpet
             if threat >= 10.0 and best_carpet_pts >= 6.0:
                 return best_carpet
-            if threat >= 6.0 and best_carpet_pts >= threat:
+            if threat >= 6.0 and best_carpet_pts >= max(4.0, threat - 2.0):
                 return best_carpet
 
         denial_move = self._best_denial_move(board, legal_moves)
@@ -328,6 +341,8 @@ class PlayerAgent:
         if forced_block is not None:
             return forced_block
 
+        if best_cash is not None and float(CARPET_VALUES[best_cash.roll_length]) >= 6.0:
+            return best_cash
         if best_carpet is not None and float(CARPET_VALUES[best_carpet.roll_length]) >= 6.0:
             return best_carpet
 
@@ -335,7 +350,8 @@ class PlayerAgent:
         top_p = belief[top_idx]
         top_ev = self._search_ev(top_p) - self._search_repeat_penalty(board, top_idx)
         turns_left = board.player_worker.turns_left
-        if threat < 4.0 and top_ev >= 3.8 and top_p >= 0.92 and turns_left > 2:
+        my_now = self._best_immediate_carpet_points(board, enemy=False)
+        if threat < 4.0 and my_now < 4.0 and top_ev >= 3.9 and top_p >= 0.93 and turns_left > 2:
             return move.Move.search(self._idx_to_pos(top_idx))
 
         return None
@@ -348,23 +364,31 @@ class PlayerAgent:
         best = None
         best_score = -inf
         opp_now = self._best_enemy_immediate_carpet_points(board)
+        my_now = self._best_immediate_carpet_points(board, enemy=False)
         for mv in legal_moves:
             if mv.move_type != enums.MoveType.CARPET:
                 continue
             pts = float(CARPET_VALUES[mv.roll_length])
             denied_now, denied_total, after_now, _ = self._move_denial_delta(board, mv)
-            score = 132.0 * pts + 18.0 * mv.roll_length
-            score += 150.0 * denied_now + 95.0 * denied_total
+            contested = self._is_contested_cash_move(board, mv)
+            score = 156.0 * pts + 20.0 * mv.roll_length
+            score += 170.0 * denied_now + 110.0 * denied_total
+            if contested:
+                score += 190.0
             if pts <= 0.0:
-                score += 150.0 * denied_total - 90.0
+                score += 170.0 * denied_total - 110.0
             elif pts == 2.0:
-                score -= 10.0
+                score -= 12.0
+            elif pts == 4.0:
+                score += 30.0
             if pts >= opp_now and pts >= 4.0:
-                score += 160.0
+                score += 180.0
+            if pts >= my_now and pts >= 4.0:
+                score += 70.0
             if pts >= 10.0:
-                score += 220.0
+                score += 230.0
             if opp_now >= 6.0 and after_now <= max(0.0, opp_now - 4.0):
-                score += 140.0
+                score += 160.0
             if score > best_score:
                 best_score = score
                 best = mv
@@ -460,6 +484,8 @@ class PlayerAgent:
         point_margin_now = (
             board.player_worker.get_points() - board.opponent_worker.get_points()
         )
+        my_now = self._best_immediate_carpet_points(board, enemy=False)
+        opp_now = self._best_enemy_immediate_carpet_points(board)
 
         for idx in top:
             p = belief[idx]
@@ -473,11 +499,13 @@ class PlayerAgent:
                 continue
             if miss_gate and ev < 4.2:
                 continue
-            # Panic-search gate: if we're behind and belief is weak, a miss
-            # compounds the deficit. Require a stronger positive-EV signal.
             if point_margin_now <= -4 and ev < 1.8:
                 continue
             if repeat_pen >= 2.4 and turns_left <= 8:
+                continue
+            if my_now >= 4.0 and ev < 3.8:
+                continue
+            if opp_now >= 4.0 and ev < 3.0:
                 continue
             if turns_left <= 6 and ev < 1.1 and best_board > 560.0:
                 continue
@@ -486,10 +514,9 @@ class PlayerAgent:
             if turns_left <= 2 and ev < 3.6:
                 continue
 
-            opp_now = self._best_enemy_immediate_carpet_points(board)
-            if opp_now >= 10.0 and ev < 3.6:
+            if opp_now >= 10.0 and ev < 3.8:
                 continue
-            if opp_now >= 6.0 and ev < 3.0:
+            if opp_now >= 6.0 and ev < 3.2:
                 continue
 
             searches.append(move.Move.search(self._idx_to_pos(idx)))
@@ -497,9 +524,6 @@ class PlayerAgent:
                 break
 
         entropy_bucket = self._belief_entropy_bucket(belief)
-        point_margin = (
-            board.player_worker.get_points() - board.opponent_worker.get_points()
-        )
         turns_left = board.player_worker.turns_left
         max_keep = len(searches)
         if entropy_bucket >= 1:
@@ -801,39 +825,48 @@ class PlayerAgent:
         search_term = max(0.0, self._best_search_ev(belief))
         threat_gap = max(0.0, opp_now - my_now)
 
-        score = 34.0 * point_margin
-        score += 10.0 * my_now - 17.0 * opp_now
-        score += 4.5 * my_next - 7.8 * opp_next
-        score += 4.5 * my_access - 6.5 * opp_access
-        score += 1.8 * (my_mob - opp_mob)
+        score = 36.0 * point_margin
+        score += 16.0 * my_now - 24.0 * opp_now
+        score += 5.0 * my_next - 9.5 * opp_next
+        score += 5.5 * my_access - 8.0 * opp_access
+        score += 1.7 * (my_mob - opp_mob)
         score += block_term
-        score += 0.8 * search_term
+        score += 0.55 * search_term
 
-        tactical_swing = my_now - opp_now
-        score += 12.0 * tactical_swing
-
+        if my_now >= 4.0:
+            score += 28.0
         if my_now >= 6.0:
-            score += 26.0
+            score += 42.0
         if my_now >= 10.0:
-            score += 34.0
+            score += 56.0
+        if opp_now >= 4.0:
+            score -= 44.0
         if opp_now >= 6.0:
-            score -= 70.0
+            score -= 82.0
         if opp_now >= 10.0:
-            score -= 110.0
+            score -= 132.0
 
-        if turns_left <= 12:
+        score += 12.0 * (my_now - opp_now)
+        score -= 8.0 * max(0.0, opp_access - my_access)
+
+        if turns_left <= 16:
+            score += 10.0 * my_now
+            score -= 18.0 * opp_now
+            score += 5.0 * my_access
+            score -= 8.0 * opp_access
+        if turns_left <= 10:
             score += 14.0 * my_now
-            score -= 29.0 * opp_now
+            score -= 25.0 * opp_now
             score += 7.0 * my_access
-            score -= 10.0 * opp_access
-            score -= 12.0 * max(0.0, opp_next - my_next)
+            score -= 12.0 * opp_access
+            score -= 8.0 * max(0.0, opp_next - my_next)
         if turns_left <= 6:
-            score += 20.0 * my_now
-            score -= 36.0 * opp_now
-            score += 9.0 * my_access
-            score -= 14.0 * opp_access
+            score += 18.0 * my_now
+            score -= 32.0 * opp_now
+            score += 10.0 * my_access
+            score -= 16.0 * opp_access
             score -= 12.0 * threat_gap
-            score -= 2.0 * search_term
+            score -= 2.5 * search_term
 
         if point_margin < -4:
             score += 8.0 * (my_now - opp_now)
@@ -872,28 +905,40 @@ class PlayerAgent:
             return self._search_quick_score(board, belief, idx)
 
         denied_now, denied_total, after_now, _ = self._move_denial_delta(board, mv)
+        my_now = self._best_immediate_carpet_points(board, enemy=False)
+        opp_now = self._best_enemy_immediate_carpet_points(board)
 
         if mv.move_type == enums.MoveType.CARPET:
             pts = float(CARPET_VALUES[mv.roll_length])
-            opp_now = self._best_enemy_immediate_carpet_points(board)
-            score = 430.0 + 148.0 * pts + 20.0 * mv.roll_length
-            score += 145.0 * denied_now + 90.0 * denied_total
+            contested = self._is_contested_cash_move(board, mv)
+            score = 450.0 + 162.0 * pts + 20.0 * mv.roll_length
+            score += 150.0 * denied_now + 98.0 * denied_total
+            if contested:
+                score += 230.0
             if pts <= 0.0:
-                score += 170.0 * denied_total - 120.0
+                score += 185.0 * denied_total - 130.0
             elif pts == 2.0:
-                score -= 10.0
+                score -= 8.0
             elif pts == 4.0:
-                score += 35.0
+                score += 42.0
             if pts >= opp_now and pts >= 4.0:
-                score += 170.0
+                score += 180.0
+            if pts >= my_now and pts >= 4.0:
+                score += 95.0
             if pts >= 10.0:
-                score += 220.0
+                score += 230.0
             if opp_now >= 6.0 and after_now <= max(0.0, opp_now - 4.0):
-                score += 140.0
+                score += 160.0
             return score
 
         current = board.player_worker.get_location()
         dest = enums.loc_after_direction(current, mv.direction)
+        leave_cash_pen = 0.0
+        if my_now >= 4.0 and after_now >= max(4.0, my_now - 2.0):
+            leave_cash_pen += 115.0 * my_now + 70.0 * after_now
+        if opp_now >= 4.0 and denied_now <= 0.5:
+            leave_cash_pen += 45.0 * opp_now
+
         if mv.move_type == enums.MoveType.PRIME:
             future = self._future_carpet_points_from(board, dest)
             opp_loc = board.opponent_worker.get_location()
@@ -902,26 +947,29 @@ class PlayerAgent:
                 chain_val = self._chain_value_through(board, current, mv.direction)
                 future = max(future, chain_val)
             score = (
-                240.0
-                + 34.0 * future
+                232.0
+                + 30.0 * future
                 + self._block_bonus_at(board, dest)
                 + 9.0 * self._open_neighbors(board, dest)
-                + 82.0 * denied_now
-                + 54.0 * denied_total
+                + 86.0 * denied_now
+                + 56.0 * denied_total
             )
             if board.player_worker.turns_left <= 10 and future < 4.0:
-                score -= 24.0
+                score -= 20.0
+            score -= leave_cash_pen
             return score
 
-        return (
-            88.0
+        score = (
+            92.0
             + self._block_bonus_at(board, dest)
             + 8.0 * self._open_neighbors(board, dest)
             + 4.0 * self._belief_mass_near(dest, belief)
             + 7.0 * self._future_carpet_points_from(board, dest)
-            + 76.0 * denied_now
-            + 52.0 * denied_total
+            + 80.0 * denied_now
+            + 54.0 * denied_total
         )
+        score -= leave_cash_pen
+        return score
 
     def _search_quick_score(
         self,
@@ -936,30 +984,27 @@ class PlayerAgent:
         my_now = self._best_immediate_carpet_points(board, enemy=False)
         opp_now = self._best_immediate_carpet_points(board, enemy=True)
         turns_left = board.player_worker.turns_left
-        point_margin = (
-            board.player_worker.get_points() - board.opponent_worker.get_points()
-        )
 
         if ev > 0.0:
-            score = 430.0 + 760.0 * ev + 220.0 * p
+            score = 410.0 + 735.0 * ev + 215.0 * p
         else:
-            score = -120.0 + 120.0 * p + 90.0 * ev
+            score = -130.0 + 120.0 * p + 90.0 * ev
         if repeat_pen > 0.0:
-            score -= 240.0 * repeat_pen
+            score -= 250.0 * repeat_pen
+        if my_now >= 4.0:
+            score -= 140.0 * my_now
+        if opp_now >= 4.0:
+            score -= 110.0 * opp_now
         if opp_now >= 6.0:
-            score -= 360.0
-        if opp_now >= 10.0:
-            score -= 280.0
-        if my_now >= 6.0:
-            score -= 140.0
-        if turns_left <= 10:
-            score -= 165.0 * max(my_now, opp_now)
-        if turns_left <= 6 and ev < 1.5:
-            score -= 170.0
-        if turns_left <= 4 and ev < 2.4:
-            score -= 220.0
-        if turns_left <= 2 and ev < 3.8:
-            score -= 520.0
+            score -= 180.0
+        if turns_left <= 12:
+            score -= 95.0 * max(my_now, opp_now)
+        if turns_left <= 6 and ev < 1.8:
+            score -= 210.0
+        if turns_left <= 4 and ev < 2.6:
+            score -= 260.0
+        if turns_left <= 2 and ev < 3.9:
+            score -= 560.0
         return score
 
     def _best_board_move_heuristic(
@@ -1047,26 +1092,26 @@ class PlayerAgent:
         if len(scored_moves) >= 2:
             gap = scored_moves[0][0] - scored_moves[1][0]
 
-        weight = 0.42
-        if turns_left <= 12:
+        weight = 0.56
+        if turns_left <= 18:
+            weight += 0.05
+        if turns_left <= 10:
             weight += 0.08
         if turns_left <= 6:
             weight += 0.10
-        if immediate >= 6.0:
-            weight += 0.14
-        if immediate >= 10.0:
-            weight += 0.10
-        if access >= 6.0:
+        if immediate >= 4.0:
             weight += 0.06
+        if immediate >= 6.0:
+            weight += 0.10
+        if immediate >= 10.0:
+            weight += 0.06
+        if access >= 6.0:
+            weight += 0.05
         if gap >= 120.0:
-            weight += 0.08
+            weight += 0.07
         elif gap <= 35.0:
             weight -= 0.05
-        return max(0.25, min(0.82, weight))
-
-    # ------------------------------------------------------------------
-    # Search depth / width / time management
-    # ------------------------------------------------------------------
+        return max(0.35, min(0.90, weight))
 
     def _max_search_depth(
         self,
@@ -1075,23 +1120,23 @@ class PlayerAgent:
         belief: Sequence[float],
     ) -> int:
         if not ordered_moves:
-            return 5
+            return 6
         if len(ordered_moves) == 1:
-            return 7
+            return 8
         first = self._move_heuristic(board, belief, ordered_moves[0])
         second = self._move_heuristic(board, belief, ordered_moves[1])
         gap = first - second
         turns_left = board.player_worker.turns_left
-        base = 5
-        if turns_left <= 12:
+        base = 6
+        if turns_left <= 14:
             base += 1
-        if turns_left <= 6:
+        if turns_left <= 8:
             base += 1
         if gap >= 260.0:
             base += 1
         elif gap <= 60.0:
             base -= 1
-        return max(4, min(7, base))
+        return max(5, min(8, base))
 
     def _root_width(self, board: game_board.Board) -> int:
         return self._root_move_limit(board)
@@ -1102,76 +1147,79 @@ class PlayerAgent:
     def _root_move_limit(self, board: game_board.Board) -> int:
         my_turn_index = 40 - board.player_worker.turns_left
         if my_turn_index == 0:
-            return 4
-        if my_turn_index == 1:
-            return 5
-        if my_turn_index == 2:
             return 6
-        if my_turn_index < 8:
+        if my_turn_index == 1:
             return 7
-        if board.player_worker.turns_left <= 6:
-            return 7
-        if board.player_worker.turns_left <= 10:
+        if my_turn_index == 2:
             return 8
-        if my_turn_index < 24:
+        if my_turn_index < 8:
             return 9
-        return 8
+        if board.player_worker.turns_left <= 6:
+            return 9
+        if board.player_worker.turns_left <= 10:
+            return 10
+        if my_turn_index < 24:
+            return 10
+        return 9
 
     def _node_move_limit(self, board: game_board.Board) -> int:
         my_turn_index = 40 - board.player_worker.turns_left
         if my_turn_index == 0:
-            return 3
+            return 4
         if my_turn_index == 1:
-            return 4
+            return 5
         if my_turn_index == 2:
-            return 5
+            return 6
         if my_turn_index < 8:
-            return 6
+            return 7
         if board.player_worker.turns_left <= 6:
-            return 4
-        if board.player_worker.turns_left <= 10:
             return 5
-        if my_turn_index < 24:
+        if board.player_worker.turns_left <= 10:
             return 6
-        return 5
+        if my_turn_index < 24:
+            return 7
+        return 6
 
     def _turn_budget(self, board: game_board.Board, time_remaining: float) -> float:
         turns_left = max(1, board.player_worker.turns_left)
-        if time_remaining > 120.0:
-            reserve = 45.0
-        elif time_remaining > 60.0:
-            reserve = 28.0
-        elif time_remaining > 25.0:
-            reserve = 14.0
+        if time_remaining > 150.0:
+            reserve = 48.0
+        elif time_remaining > 90.0:
+            reserve = 32.0
+        elif time_remaining > 40.0:
+            reserve = 18.0
         else:
-            reserve = 5.0
+            reserve = 7.0
 
-        spendable = max(0.3, time_remaining - reserve)
+        spendable = max(0.4, time_remaining - reserve)
         base = spendable / turns_left
         turn_idx = 40 - turns_left
+
         if turn_idx == 0:
-            boost = 0.25
+            boost = 0.42
         elif turn_idx == 1:
-            boost = 0.40
+            boost = 0.62
         elif turn_idx == 2:
-            boost = 0.55
+            boost = 0.82
         elif turn_idx < 8:
-            boost = 0.95
+            boost = 1.10
         elif turn_idx < 24:
-            boost = 1.28
+            boost = 1.36
         else:
-            boost = 1.05
+            boost = 1.16
+
         if self._best_search_ev(self.belief) > 1.0:
-            boost += 0.15
+            boost += 0.10
+        if self._best_enemy_immediate_carpet_points(board) >= 6.0:
+            boost += 0.12
+        if self._best_immediate_carpet_points(board, enemy=False) >= 6.0:
+            boost += 0.10
         if turns_left <= 10:
-            boost += 0.20
+            boost += 0.14
         if turns_left <= 6:
             boost += 0.10
-        return min(11.0, max(0.75, base * boost))
 
-    # ------------------------------------------------------------------
-    # Transposition table
-    # ------------------------------------------------------------------
+        return min(9.5, max(1.10, base * boost))
 
     def _probe_tt(
         self,
@@ -1423,6 +1471,54 @@ class PlayerAgent:
                 best = mv
         return best
 
+    def _best_cash_now_move(
+        self,
+        board: game_board.Board,
+        legal_moves: Sequence[move.Move],
+    ) -> move.Move | None:
+        best = None
+        best_score = -inf
+        for mv in legal_moves:
+            if mv.move_type != enums.MoveType.CARPET:
+                continue
+            pts = float(CARPET_VALUES[mv.roll_length])
+            if pts < 4.0:
+                continue
+            denied_now, denied_total, after_now, _ = self._move_denial_delta(board, mv)
+            contested = self._is_contested_cash_move(board, mv)
+            score = 210.0 * pts + 160.0 * denied_now + 105.0 * denied_total
+            score += 28.0 * mv.roll_length
+            if contested:
+                score += 220.0
+            if after_now <= max(0.0, self._best_enemy_immediate_carpet_points(board) - 2.0):
+                score += 90.0
+            if score > best_score:
+                best_score = score
+                best = mv
+        return best
+
+    def _is_contested_cash_move(
+        self,
+        board: game_board.Board,
+        mv: move.Move,
+    ) -> bool:
+        if mv.move_type != enums.MoveType.CARPET:
+            return False
+        pts = float(CARPET_VALUES[mv.roll_length])
+        if pts < 4.0:
+            return False
+        before_now = self._best_enemy_immediate_carpet_points(board)
+        denied_now, denied_total, after_now, _ = self._move_denial_delta(board, mv)
+        if before_now >= pts:
+            return True
+        if denied_now >= 2.0:
+            return True
+        if denied_total >= 3.5:
+            return True
+        if after_now <= max(0.0, before_now - 2.0):
+            return True
+        return False
+
     def _drop_len1_carpets(
         self,
         board: game_board.Board,
@@ -1461,15 +1557,18 @@ class PlayerAgent:
         belief: Sequence[float],
         mv: move.Move,
     ) -> bool:
-        if mv.move_type == enums.MoveType.CARPET and mv.roll_length >= 3:
-            return True
+        if mv.move_type == enums.MoveType.CARPET:
+            if mv.roll_length >= 3:
+                return True
+            return self._is_contested_cash_move(board, mv)
         if mv.move_type == enums.MoveType.SEARCH:
             p = belief[self._pos_to_idx(mv.search_loc)]
             return p >= 0.7
         if mv.move_type in (enums.MoveType.PLAIN, enums.MoveType.PRIME):
             cur = board.player_worker.get_location()
             dest = enums.loc_after_direction(cur, mv.direction)
-            return self._block_bonus_at(board, dest) >= 95.0
+            denied_now, denied_total, _, _ = self._move_denial_delta(board, mv)
+            return self._block_bonus_at(board, dest) >= 95.0 or denied_now >= 2.0 or denied_total >= 3.0
         return False
 
     def _best_search_ev(self, belief: Sequence[float]) -> float:
