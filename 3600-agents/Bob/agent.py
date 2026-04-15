@@ -29,6 +29,11 @@ class PlayerAgent:
         self._time_left: Optional[Callable] = time_left
         self._time_safety_margin = 0.0
 
+        # Anti-loop / anti-stall state across real turns.
+        self.recent_positions = deque(maxlen=8)
+        self.last_seen_points: Optional[int] = None
+        self.zero_gain_streak = 0
+
     def commentate(self):
         return ""
 
@@ -40,6 +45,17 @@ class PlayerAgent:
     ):
         self.root_is_player_a = board.player_worker.is_player_a
         self._configure_timer(time_left)
+
+        current_points = board.player_worker.get_points()
+        if self.last_seen_points is not None:
+            if current_points <= self.last_seen_points:
+                self.zero_gain_streak = min(self.zero_gain_streak + 1, 6)
+            else:
+                self.zero_gain_streak = 0
+        self.last_seen_points = current_points
+
+        current_loc = board.player_worker.get_location()
+        self.recent_positions.append(current_loc)
 
         self.update_belief(board, sensor_data)
         belief = (
@@ -213,37 +229,38 @@ class PlayerAgent:
 
         root_worker, enemy_worker = self.root_workers(board_state)
 
-        point_margin = 15.0 * (root_worker.get_points() - enemy_worker.get_points())
+        root_loc = root_worker.get_location()
+        enemy_loc = enemy_worker.get_location()
+
+        point_margin = 16.0 * (root_worker.get_points() - enemy_worker.get_points())
 
         my_now = max(
-            0.0,
-            self.best_immediate_carpet_points_from_loc(
-                board_state, root_worker.get_location()
-            ),
+            0.0, self.best_immediate_carpet_points_from_loc(board_state, root_loc)
         )
         enemy_now = max(
-            0.0,
-            self.best_immediate_carpet_points_from_loc(
-                board_state, enemy_worker.get_location()
-            ),
+            0.0, self.best_immediate_carpet_points_from_loc(board_state, enemy_loc)
         )
 
-        my_lane = self.lane_profile_score_from_loc(
-            board_state, root_worker.get_location()
-        )
-        enemy_lane = self.lane_profile_score_from_loc(
-            board_state, enemy_worker.get_location()
-        )
+        my_lane = self.lane_profile_score_from_loc(board_state, root_loc)
+        enemy_lane = self.lane_profile_score_from_loc(board_state, enemy_loc)
 
-        my_area = self.area_profile_score_from_loc(
-            board_state, root_worker.get_location()
-        )
-        enemy_area = self.area_profile_score_from_loc(
-            board_state, enemy_worker.get_location()
-        )
+        my_area = self.area_profile_score_from_loc(board_state, root_loc)
+        enemy_area = self.area_profile_score_from_loc(board_state, enemy_loc)
 
-        conversion_margin = 4.5 * (my_now - enemy_now) + 2.0 * (my_lane - enemy_lane)
-        area_margin = 1.35 * (my_area - enemy_area)
+        my_frontier = self.frontier_pull_score(board_state, root_loc)
+        enemy_frontier = self.frontier_pull_score(board_state, enemy_loc)
+
+        conversion_margin = 5.2 * (my_now - enemy_now) + 2.6 * (my_lane - enemy_lane)
+        area_margin = 0.10 * (my_area - enemy_area)
+        frontier_margin = 0.45 * (my_frontier - enemy_frontier)
+
+        side_term = 0.0
+        prof_side, side_margin = self.profitable_side(board_state)
+        if prof_side != 0:
+            if self.side_of(root_loc) == prof_side:
+                side_term += 0.8 * side_margin
+            if self.side_of(enemy_loc) == prof_side:
+                side_term -= 0.7 * side_margin
 
         threat_term = 0.0
         if enemy_now >= 10.0:
@@ -254,12 +271,14 @@ class PlayerAgent:
             threat_term -= 7.0
 
         if my_now >= 10.0:
-            threat_term += 10.0
+            threat_term += 12.0
         elif my_now >= 6.0:
-            threat_term += 4.0
+            threat_term += 5.0
+        elif my_now >= 4.0:
+            threat_term += 2.0
 
-        rat_term = -0.45 * self.expected_distance(root_worker.get_location(), belief)
-        rat_term += 0.15 * self.expected_distance(enemy_worker.get_location(), belief)
+        rat_term = -0.35 * self.expected_distance(root_loc, belief)
+        rat_term += 0.10 * self.expected_distance(enemy_loc, belief)
 
         turn_margin = 0.3 * (root_worker.turns_left - enemy_worker.turns_left)
 
@@ -267,6 +286,8 @@ class PlayerAgent:
             point_margin
             + conversion_margin
             + area_margin
+            + frontier_margin
+            + side_term
             + threat_term
             + rat_term
             + turn_margin
@@ -338,6 +359,47 @@ class PlayerAgent:
         failed[self.pos_to_index(search_loc)] = 0.0
         return self.normalize(failed, board_state)
 
+    def immediate_point_gain(self, board_state, candidate_move, preview_board=None):
+        preview = preview_board if preview_board is not None else self.preview_move(
+            board_state, candidate_move
+        )
+        return float(
+            preview.player_worker.get_points() - board_state.player_worker.get_points()
+        )
+
+    def best_available_point_gain(self, board_state):
+        best = 0.0
+        for candidate in board_state.get_valid_moves(exclude_search=True):
+            try:
+                gain = self.immediate_point_gain(board_state, candidate)
+            except Exception:
+                continue
+            if gain > best:
+                best = gain
+        return best
+
+    def loop_penalty(self, next_loc, available_cash, point_gain):
+        if point_gain > 0.0:
+            return 0.0
+
+        repeats = sum(1 for loc in self.recent_positions if loc == next_loc)
+        if repeats <= 0:
+            return 0.0
+
+        recent = list(self.recent_positions)
+        penalty = 2.5 * repeats
+
+        if len(recent) >= 2 and next_loc == recent[-2]:
+            penalty += 4.5
+        if len(recent) >= 4 and next_loc in recent[-4:]:
+            penalty += 2.0
+
+        if available_cash >= 2.0:
+            penalty += 1.5 * available_cash
+
+        penalty += 1.2 * min(self.zero_gain_streak, 4)
+        return penalty
+
     def action_adjustment(
         self,
         board_state,
@@ -362,9 +424,10 @@ class PlayerAgent:
         next_actor_loc = preview.player_worker.get_location()
         next_opp_loc = preview.opponent_worker.get_location()
 
-        before_points = board_state.player_worker.get_points()
-        after_points = preview.player_worker.get_points()
-        point_gain = float(after_points - before_points)
+        point_gain = self.immediate_point_gain(
+            board_state, candidate_move, preview_board=preview
+        )
+        available_cash = self.best_available_point_gain(board_state)
 
         before_lane = self.lane_profile_score_from_loc(board_state, actor_loc)
         after_lane = self.lane_profile_score_from_loc(preview, next_actor_loc)
@@ -390,75 +453,132 @@ class PlayerAgent:
         opp_before_area = self.area_profile_score_from_loc(board_state, opp_loc)
         opp_after_area = self.area_profile_score_from_loc(preview, next_opp_loc)
 
+        before_frontier = self.frontier_pull_score(board_state, actor_loc)
+        after_frontier = self.frontier_pull_score(preview, next_actor_loc)
+        opp_before_frontier = self.frontier_pull_score(board_state, opp_loc)
+        opp_after_frontier = self.frontier_pull_score(preview, next_opp_loc)
+
         lane_delta = after_lane - before_lane
         now_delta = after_now - before_now
         area_delta = after_area - before_area
+        frontier_delta = after_frontier - before_frontier
 
         deny_delta = (opp_before_lane - opp_after_lane) + 1.4 * (
             opp_before_now - opp_after_now
         )
         deny_area = opp_before_area - opp_after_area
+        deny_frontier = opp_before_frontier - opp_after_frontier
 
         score = (
-            4.0 * point_gain
-            + 2.2 * lane_delta
-            + 1.2 * now_delta
-            + 1.25 * area_delta
-            + 1.2 * deny_delta
-            + 0.8 * deny_area
+            5.0 * point_gain
+            + 2.6 * lane_delta
+            + 1.4 * now_delta
+            + 0.08 * area_delta
+            + 0.35 * frontier_delta
+            + 1.35 * deny_delta
+            + 0.08 * deny_area
+            + 0.18 * deny_frontier
         )
+
+        if point_gain >= 2.0:
+            score += 6.0 + 2.0 * point_gain
+        if point_gain >= 4.0:
+            score += 6.0
+        if point_gain >= available_cash >= 2.0:
+            score += 4.0
+
+        live_cash = before_now
+        enemy_threat = opp_before_now
 
         if candidate_move.move_type == enums.MoveType.PRIME:
             if after_now > before_now:
-                score += 4.0 * (after_now - before_now)
+                score += 2.5 * (after_now - before_now)
             if after_now >= 4.0 and after_now > before_now:
-                score += 8.0
-            if after_now >= 6.0 and after_now > before_now:
-                score += 8.0
-            if after_lane > before_lane and after_now >= 2.0:
                 score += 4.0
-            if after_area > before_area:
-                score += 1.2 * (after_area - before_area)
+            if after_now >= 6.0 and after_now > before_now:
+                score += 4.0
+            if after_lane > before_lane and after_now >= 2.0:
+                score += 2.0
+            if after_frontier > before_frontier:
+                score += 0.8 * (after_frontier - before_frontier)
+
+            if live_cash >= 4.0 and point_gain <= 0.0 and enemy_threat < 6.0:
+                score -= 18.0 + 3.0 * live_cash
+            elif available_cash >= 4.0 and point_gain <= 0.0 and enemy_threat < 6.0:
+                score -= 8.0 + 1.5 * available_cash
 
         elif candidate_move.move_type == enums.MoveType.CARPET:
             junk_penalty = 0.0
 
-            if point_gain <= 0.0 and opp_before_now < 6.0:
-                junk_penalty += 18.0
+            if point_gain <= 0.0 and enemy_threat < 6.0:
+                junk_penalty += 20.0
 
-            if point_gain <= 2.0 and before_now >= 4.0 and opp_before_now < 6.0:
-                junk_penalty += 12.0
+            if point_gain <= 2.0 and live_cash >= 4.0 and enemy_threat < 6.0:
+                junk_penalty += 14.0
 
-            if point_gain < before_now and opp_before_now < 6.0:
-                junk_penalty += 2.7 * (before_now - point_gain)
+            if point_gain < live_cash and enemy_threat < 6.0:
+                junk_penalty += 3.0 * (live_cash - point_gain)
 
-            if after_lane < before_lane and point_gain < 4.0 and opp_before_now < 6.0:
-                junk_penalty += 1.6 * (before_lane - after_lane)
+            if after_lane < before_lane and point_gain < 4.0 and enemy_threat < 6.0:
+                junk_penalty += 1.5 * (before_lane - after_lane)
 
-            if after_area < before_area and point_gain < 4.0 and opp_before_now < 6.0:
-                junk_penalty += 1.0 * (before_area - after_area)
+            if (
+                after_frontier + 1.5 < before_frontier
+                and point_gain < 4.0
+                and enemy_threat < 6.0
+            ):
+                junk_penalty += 0.8 * (before_frontier - after_frontier)
 
-            if opp_before_now >= 10.0 and opp_after_now < opp_before_now:
+            if enemy_threat >= 10.0 and opp_after_now < enemy_threat:
                 score += 10.0
-            elif opp_before_now >= 6.0 and opp_after_now < opp_before_now:
+            elif enemy_threat >= 6.0 and opp_after_now < enemy_threat:
                 score += 5.0
 
-            if point_gain >= 6.0:
-                score += 8.0
-            if point_gain >= 10.0:
+            if point_gain >= 4.0:
+                score += 12.0 + 2.0 * point_gain
+            elif point_gain >= 2.0:
+                score += 6.0 + 1.5 * point_gain
+
+            if live_cash >= 4.0 and point_gain >= live_cash:
                 score += 10.0
 
             score -= junk_penalty
 
         else:
             if after_now > before_now:
-                score += 3.2 * (after_now - before_now)
+                score += 1.8 * (after_now - before_now)
             if after_lane > before_lane and after_now >= 2.0:
-                score += 2.0
-            if after_area > before_area:
-                score += 1.8 * (after_area - before_area)
-            if after_area + 4.0 < before_area and point_gain <= 0.0:
-                score -= 6.0
+                score += 1.0
+            if after_frontier > before_frontier:
+                score += 1.0 * (after_frontier - before_frontier)
+
+            if live_cash >= 4.0 and point_gain <= 0.0 and enemy_threat < 6.0:
+                score -= 22.0 + 3.5 * live_cash
+            elif available_cash >= 4.0 and point_gain <= 0.0:
+                score -= (
+                    12.0
+                    + 2.5 * available_cash
+                    + 2.0 * min(self.zero_gain_streak, 4)
+                )
+            elif available_cash >= 2.0 and point_gain <= 0.0:
+                score -= (
+                    6.0
+                    + 1.5 * available_cash
+                    + 1.5 * min(self.zero_gain_streak, 4)
+                )
+
+            if point_gain <= 0.0 and after_now < before_now and enemy_threat < 6.0:
+                score -= 5.0 * (before_now - after_now)
+
+        score -= self.loop_penalty(next_actor_loc, available_cash, point_gain)
+        score -= self.side_abandonment_penalty(
+            board_state,
+            actor_loc,
+            next_actor_loc,
+            point_gain,
+            before_frontier,
+            after_frontier,
+        )
 
         return sign * score
 
@@ -559,6 +679,7 @@ class PlayerAgent:
         my_area = self.area_profile_score_from_loc(
             board_state, board_state.player_worker.get_location()
         )
+        available_cash = self.best_available_point_gain(board_state)
 
         top_indices = sorted(
             range(len(belief)), key=lambda idx: belief[idx], reverse=True
@@ -571,6 +692,8 @@ class PlayerAgent:
         if my_now >= 4.0:
             return []
         if my_area >= 18.0:
+            return []
+        if available_cash >= 2.0:
             return []
         if top_prob < 0.50:
             return []
@@ -716,6 +839,111 @@ class PlayerAgent:
 
         return score
 
+    def side_of(self, loc):
+        x, _ = loc
+        mid = enums.BOARD_SIZE // 2
+        if x < mid:
+            return -1
+        if x > mid:
+            return 1
+        return 0
+
+    def local_open_degree(self, board_state, loc):
+        return len(self.passable_neighbors(board_state, loc))
+
+    def candidate_cells_for_frontier(self, board_state):
+        cells = []
+        my_loc = board_state.player_worker.get_location()
+        opp_loc = board_state.opponent_worker.get_location()
+
+        for y in range(enums.BOARD_SIZE):
+            for x in range(enums.BOARD_SIZE):
+                loc = (x, y)
+                if not board_state.is_valid_cell(loc):
+                    continue
+                if board_state.get_cell(loc) == enums.Cell.BLOCKED:
+                    continue
+                if loc == my_loc or loc == opp_loc:
+                    continue
+
+                lane = self.lane_profile_score_from_loc(board_state, loc)
+                now = max(
+                    0.0, self.best_immediate_carpet_points_from_loc(board_state, loc)
+                )
+                open_deg = self.local_open_degree(board_state, loc)
+
+                score = 1.9 * now + 1.25 * lane + 0.4 * open_deg
+                if score > 0.0:
+                    cells.append((score, loc))
+
+        cells.sort(reverse=True, key=lambda item: item[0])
+        return cells[:8]
+
+    def frontier_pull_score(self, board_state, loc):
+        frontier = self.candidate_cells_for_frontier(board_state)
+        if not frontier:
+            return 0.0
+
+        total = 0.0
+        for value, cell in frontier:
+            d = self.manhattan(loc, cell)
+            total += value / (1.0 + d)
+        return total
+
+    def frontier_side_balance(self, board_state):
+        left = 0.0
+        right = 0.0
+        center = 0.0
+
+        for value, loc in self.candidate_cells_for_frontier(board_state):
+            side = self.side_of(loc)
+            if side < 0:
+                left += value
+            elif side > 0:
+                right += value
+            else:
+                center += value
+
+        return left, center, right
+
+    def profitable_side(self, board_state):
+        left, center, right = self.frontier_side_balance(board_state)
+        if left > right + 4.0:
+            return -1, left - right
+        if right > left + 4.0:
+            return 1, right - left
+        return 0, abs(right - left)
+
+    def side_abandonment_penalty(
+        self,
+        board_state,
+        current_loc,
+        next_loc,
+        point_gain,
+        before_frontier_pull,
+        after_frontier_pull,
+    ):
+        profitable_side, side_margin = self.profitable_side(board_state)
+        if profitable_side == 0:
+            return 0.0
+
+        cur_side = self.side_of(current_loc)
+        nxt_side = self.side_of(next_loc)
+
+        penalty = 0.0
+
+        if (
+            cur_side == profitable_side
+            and nxt_side != profitable_side
+            and point_gain <= 0.0
+        ):
+            penalty += 7.0 + 0.9 * side_margin
+
+        if after_frontier_pull + 2.0 < before_frontier_pull and point_gain <= 0.0:
+            penalty += 1.2 * (before_frontier_pull - after_frontier_pull)
+
+        return penalty
+
     def best_immediate_carpet_run_from_loc(self, board_state, loc):
         return self.lane_runs_from_loc(board_state, loc)[0]
 
@@ -741,6 +969,7 @@ class PlayerAgent:
         )
         current_lane = self.lane_profile_score_from_loc(board_state, current_loc)
         current_area = self.area_profile_score_from_loc(board_state, current_loc)
+        available_cash = self.best_available_point_gain(board_state)
 
         penalty = 0.0
 
@@ -764,6 +993,10 @@ class PlayerAgent:
             penalty += 2.0
         if current_area >= 18.0:
             penalty += 2.0
+        if available_cash >= 2.0:
+            penalty += 3.0
+        if self.zero_gain_streak >= 2:
+            penalty += 1.5
 
         return penalty
 

@@ -17,7 +17,6 @@ class PlayerAgent:
         TODO: Your initialization code below. Should be used to do any setup you want
         before the game begins (i.e. calculating priors.)
         """
-        pass
         
     def commentate(self):
         """

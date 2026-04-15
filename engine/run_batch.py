@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Run two agents against each other N times and report win counts."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import subprocess
 import sys
 import glob
 
-NUM_GAMES = 30
+NUM_GAMES = 10
+PARALLEL_GAMES = 10
 MATCH_DIR = "3600-agents/matches"
 
 if len(sys.argv) != 3:
@@ -33,46 +35,74 @@ wins_a = 0
 wins_b = 0
 ties = 0
 
-for i in range(NUM_GAMES):
+
+def _extract_match_path(output: str) -> str | None:
+    marker = "MATCH_FILE:"
+    for line in output.splitlines():
+        if line.startswith(marker):
+            return line[len(marker) :].strip()
+    return None
+
+
+def _run_one_game(game_idx: int):
+    del game_idx
     result = subprocess.run(
         ["python3", "engine/run_local_agents.py", agent_a, agent_b],
         capture_output=True,
         text=True,
-        timeout=120,
     )
 
-    # Find the newest match JSON
-    files = glob.glob(os.path.join(MATCH_DIR, "*.json"))
-    if not files:
-        print(f"  Game {i + 1}: no match file found")
-        continue
+    if result.returncode != 0:
+        return "error", result.stderr.strip() if result.stderr else None
 
-    latest = max(files, key=os.path.getmtime)
+    match_path = _extract_match_path(result.stdout)
+    if not match_path or not os.path.exists(match_path):
+        return "missing", None
+
     try:
-        with open(latest) as fh:
+        with open(match_path) as fh:
             data = json.load(fh)
     except Exception:
-        print(f"  Game {i + 1}: failed to parse {latest}")
-        continue
+        return "parse_error", match_path
+    finally:
+        try:
+            os.remove(match_path)
+        except OSError:
+            pass
 
-    r = data.get("result", -1)
-    reason = data.get("reason", "")
-    a_pts = data.get("a_points", [])[-1] if data.get("a_points") else 0
-    b_pts = data.get("b_points", [])[-1] if data.get("b_points") else 0
+    return "ok", data.get("result", -1)
 
-    if r == 0:
-        wins_a += 1
-    elif r == 1:
-        wins_b += 1
-    else:
-        ties += 1
 
-    os.remove(latest)
+done = 0
+with ThreadPoolExecutor(max_workers=PARALLEL_GAMES) as pool:
+    futures = [pool.submit(_run_one_game, i) for i in range(NUM_GAMES)]
+    for future in as_completed(futures):
+        status, payload = future.result()
+        done += 1
 
-    if (i + 1) % 5 == 0:
-        print(
-            f"  Games {i + 1}/{NUM_GAMES} done  |  {agent_a}: {wins_a}  {agent_b}: {wins_b}  Ties: {ties}"
-        )
+        if status == "ok":
+            if payload == 0:
+                wins_a += 1
+            elif payload == 1:
+                wins_b += 1
+            else:
+                ties += 1
+        elif status == "error":
+            print(f"  Game {done}: process failed")
+            if payload:
+                print(f"    {payload}")
+            ties += 1
+        elif status == "parse_error":
+            print(f"  Game {done}: failed to parse {payload}")
+            ties += 1
+        else:
+            print(f"  Game {done}: match file missing")
+            ties += 1
+
+        if done % 5 == 0 or done == NUM_GAMES:
+            print(
+                f"  Games {done}/{NUM_GAMES} done  |  {agent_a}: {wins_a}  {agent_b}: {wins_b}  Ties: {ties}"
+            )
 
 print(f"\n{'=' * 50}")
 print(f"Final: {agent_a}: {wins_a} wins  |  {agent_b}: {wins_b} wins  |  Ties: {ties}")
